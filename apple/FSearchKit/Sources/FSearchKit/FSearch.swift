@@ -60,6 +60,10 @@ public struct FSearchProgress: Sendable, Equatable {
 
 public struct FSearchFailure: Error, Sendable, Equatable {
     public var message: String
+
+    public init(_ error: Error) {
+        message = failureMessage(error)
+    }
 }
 
 extension FSearchFailure: LocalizedError {
@@ -160,16 +164,6 @@ private func failureMessage(_ error: Error) -> String {
     switch searchError {
     case .Engine(let message):
         return message
-    }
-}
-
-extension FSearchFailure {
-    public init(message: String) {
-        self.message = message
-    }
-
-    public init(_ error: Error) {
-        self.init(message: failureMessage(error))
     }
 }
 
