@@ -2,3 +2,8 @@ target/
 .probe/
 .livetest/
 .replaytest/
+apple/FSearchKit/FSearchFFI.xcframework
+apple/FSearchKit/.build
+apple/FSearchDemo/build
+apple/FSearchDemo/DerivedData
+*.xcframework.zip

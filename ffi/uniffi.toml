@@ -1,0 +1,4 @@
+[bindings.swift]
+ffi_module_name = "FSearchFFI"
+module_name = "FSearchFFI"
+cdylib_name = "fsearch_ffi"

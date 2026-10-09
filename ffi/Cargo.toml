@@ -1,0 +1,23 @@
+[package]
+name = "fsearch-ffi"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "UniFFI bindings so Swift can run the fsearch engine in-process"
+
+[lib]
+name = "fsearch_ffi"
+crate-type = ["lib", "staticlib", "cdylib"]
+
+[dependencies]
+fsearch = { path = ".." }
+uniffi = "0.29"
+
+[features]
+cli = ["uniffi/cli"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "uniffi-bindgen.rs"
+required-features = ["cli"]
