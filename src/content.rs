@@ -638,7 +638,14 @@ fn name_ok(name: &[u8], size: u64) -> bool {
 }
 
 /// Is this path (file or directory) inside the indexed area?
+///
+/// Whole-disk mode indexes `$HOME`. A rooted engine (iOS picked folders)
+/// also indexes each root, without the home-relative skip list.
 pub fn in_scope(path: &[u8], home: &[u8]) -> bool {
+    in_home(path, home) || extra_in_scope(path, home)
+}
+
+fn in_home(path: &[u8], home: &[u8]) -> bool {
     let Some(rest) = path.strip_prefix(home) else { return false };
     if !rest.is_empty() && rest[0] != b'/' {
         return false;
@@ -647,6 +654,21 @@ pub fn in_scope(path: &[u8], home: &[u8]) -> bool {
     if SKIP_UNDER_HOME.iter().any(|p| rel.starts_with(p) && rel.get(p.len()).is_none_or(|&b| b == b'/')) {
         return false;
     }
+    allowed_rel(rel)
+}
+
+fn extra_in_scope(path: &[u8], home: &[u8]) -> bool {
+    if !crate::roots::has_extra_roots() {
+        return false;
+    }
+    let roots = crate::roots::content_roots();
+    if roots.is_empty() {
+        return false;
+    }
+    roots.iter().filter(|r| r.as_slice() != home).any(|r| crate::roots::relative_to(path, r).is_some_and(allowed_rel))
+}
+
+fn allowed_rel(rel: &[u8]) -> bool {
     !rel.split(|&b| b == b'/').any(|c| SKIP_DIRS.contains(&c) || SKIP_SUFFIXES.iter().any(|x| c.len() > x.len() && c.ends_with(x)))
 }
 
@@ -963,7 +985,7 @@ fn read_pool() -> &'static rayon::ThreadPool {
             .start_handler(|_| {
                 // Someone is waiting on these reads: keep them off the slow
                 // cores and out of the throttled IO tiers.
-                unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INITIATED, 0) };
+                crate::qos_user_initiated();
                 crate::no_materialize()
             })
             .build()

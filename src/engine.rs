@@ -11,7 +11,7 @@ use crate::walk;
 use std::collections::HashMap;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -69,6 +69,33 @@ pub struct Status {
     pub owner: bool,
 }
 
+const PHASE_IDLE: u8 = 0;
+const PHASE_SCANNING: u8 = 1;
+const PHASE_READY: u8 = 2;
+const PHASE_REFRESHING: u8 = 3;
+const PHASE_STOPPED: u8 = 4;
+
+fn phase_name(p: u8) -> &'static str {
+    match p {
+        PHASE_SCANNING => "scanning",
+        PHASE_READY => "ready",
+        PHASE_REFRESHING => "refreshing",
+        PHASE_STOPPED => "stopped",
+        _ => "idle",
+    }
+}
+
+/// What the UI polls while the index is built or refreshed.
+pub struct IndexProgress {
+    /// `idle`, `scanning`, `ready`, `refreshing`, or `stopped`.
+    pub phase: String,
+    pub ready: bool,
+    pub entries: u64,
+    /// Entries visited by the scan currently running (0 when idle).
+    pub scanned: u64,
+    pub dirs_scanned: u64,
+}
+
 #[derive(Clone)]
 pub struct Engine {
     s: Arc<Shared>,
@@ -83,8 +110,16 @@ struct Shared {
     wake: Sender<Vec<fsevents::Event>>,
     save_requested: AtomicBool,
     /// (dirs, trees) for the content worker to re-sync.
-    content_tx: Sender<(Vec<Vec<u8>>, Vec<Vec<u8>>)>,
+    content_tx: Mutex<Option<Sender<(Vec<Vec<u8>>, Vec<Vec<u8>>)>>>,
     content_rx: Mutex<Option<Receiver<(Vec<Vec<u8>>, Vec<Vec<u8>>)>>>,
+    /// Empty means the whole disk. Otherwise these folders are the index.
+    roots: Vec<Vec<u8>>,
+    phase: AtomicU8,
+    stopped: AtomicBool,
+    refresh_tx: Mutex<Option<Sender<Sender<Result<(), String>>>>>,
+    refresh_rx: Mutex<Receiver<Sender<Result<(), String>>>>,
+    apply_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    content_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     content_pending: AtomicUsize,
     /// Holding `lock`: this engine writes the index files. Another process
     /// may own them (the daemon, an app); then this one follows: it reads
@@ -109,12 +144,16 @@ fn log(msg: impl AsRef<str>) {
 
 /// Never let indexing download iCloud placeholders: on the calling thread,
 /// opening or listing a dataless file fails fast instead of materializing it.
+/// macOS only; iOS has no dataless-file policy call in the public SDK.
 pub fn no_materialize() {
-    unsafe extern "C" {
-        fn setiopolicy_np(iotype: i32, scope: i32, policy: i32) -> i32;
+    #[cfg(target_os = "macos")]
+    {
+        unsafe extern "C" {
+            fn setiopolicy_np(iotype: i32, scope: i32, policy: i32) -> i32;
+        }
+        // IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_THREAD, OFF
+        unsafe { setiopolicy_np(3, 1, 1) };
     }
-    // IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_THREAD, OFF
-    unsafe { setiopolicy_np(3, 1, 1) };
 }
 
 /// Searches run here, at user-interactive QoS: an app's background executor
@@ -122,35 +161,38 @@ pub fn no_materialize() {
 fn search_pool() -> &'static rayon::ThreadPool {
     static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
     POOL.get_or_init(|| {
-        rayon::ThreadPoolBuilder::new()
-            .thread_name(|i| format!("fsearch-search-{i}"))
-            .start_handler(|_| unsafe {
-                libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
-            })
-            .build()
-            .unwrap()
+        rayon::ThreadPoolBuilder::new().thread_name(|i| format!("fsearch-search-{i}")).start_handler(|_| crate::qos_interactive()).build().unwrap()
     })
 }
 
-fn spawn(name: &str, f: impl FnOnce() + Send + 'static) {
+fn spawn_handle(name: &str, f: impl FnOnce() + Send + 'static) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name(name.into())
         .spawn(move || {
             no_materialize();
             f()
         })
-        .expect("spawn");
+        .expect("spawn")
 }
 
-impl Engine {
-    /// Start indexing in the background and return at once; searches answer
-    /// `Err` until the index is loaded (or, on the very first run, built).
-    pub fn start(opts: Options) -> Result<Engine, String> {
-        std::fs::create_dir_all(&opts.dir).map_err(|e| e.to_string())?;
-        // One writer per index: a second one would race index writes. The
-        // lock dies with the process.
-        let lock = std::fs::File::create(opts.dir.join("daemon.lock")).map_err(|e| e.to_string())?;
-        let owner = try_lock(&lock);
+fn start_inner(opts: Options, roots: Vec<PathBuf>) -> Result<Engine, String> {
+    std::fs::create_dir_all(&opts.dir).map_err(|e| e.to_string())?;
+    let root_bytes: Vec<Vec<u8>> = roots.iter().map(|p| crate::live::normalize(p.as_os_str().as_bytes())).filter(|p| !p.is_empty()).collect();
+    let rooted = !root_bytes.is_empty();
+    if rooted {
+        invalidate_if_roots_changed(&opts.dir, &root_bytes);
+        // The user picked these folders; don't let the FDA skip list hide them.
+        walk::set_allow_all(true);
+        crate::roots::set_content_roots(root_bytes.clone());
+    } else {
+        walk::set_allow_all(false);
+        crate::roots::set_content_roots(Vec::new());
+    }
+    // One writer per index: a second one would race index writes. The
+    // lock dies with the process (or when `stop` unlocks it).
+    let lock = std::fs::File::create(opts.dir.join("daemon.lock")).map_err(|e| e.to_string())?;
+    let owner = try_lock(&lock);
+    if !rooted {
         let skip: Vec<Vec<u8>> = match opts.skip {
             Some(v) => v.into_iter().map(|p| p.as_os_str().as_bytes().to_vec()).collect(),
             None if has_full_disk_access() && std::env::var_os("FSEARCH_RESTRICT").is_none() => Vec::new(),
@@ -162,61 +204,121 @@ impl Engine {
         if !skip.is_empty() {
             let _ = walk::SKIP.set(skip);
         }
-        let dir = opts.dir;
-        let (tx, rx) = std::sync::mpsc::channel();
-        let (ctx, crx) = std::sync::mpsc::channel();
-        let content = if owner { Content::open(dir.join("content")) } else { Content::open_shared(dir.join("content")) };
-        let shared = Arc::new(Shared {
-            live: RwLock::new(None),
-            content: RwLock::new(content),
-            home: opts.home,
-            dir,
-            wake: tx,
-            save_requested: AtomicBool::new(false),
-            content_tx: ctx,
-            content_rx: Mutex::new(Some(crx)),
-            content_pending: AtomicUsize::new(0),
-            owner: AtomicBool::new(owner),
-            lock,
-            stream: Mutex::new(None),
-            replaying: AtomicBool::new(true),
-            content_seen: Mutex::new(None),
-        });
-        let base = Index::load(&shared.dir.join("index.bin"));
-        let since = match &base {
-            Some(b) if b.event_id != 0 => b.event_id,
-            _ => unsafe { fsevents::FSEventsGetCurrentEventId() },
-        };
-        if owner {
-            // Watch before scanning so nothing that changes mid-scan is
-            // missed; replaying it afterwards is harmless (diffs are idempotent).
-            shared.watch(since);
-        }
-        let s = shared.clone();
-        spawn("fsearch-apply", move || {
-            let base = match base {
-                Some(b) => {
-                    log(format!("loaded {} entries, replaying events since {}", b.n, b.event_id));
-                    if !owner {
-                        s.watch(b.event_id);
-                    }
-                    b
-                }
-                None if owner => full_build(&s, since),
-                None => {
-                    // The owner is building it; follow once it exists.
-                    let b = wait_for_index(&s.dir);
+    }
+    let dir = opts.dir;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (ctx, crx) = std::sync::mpsc::channel();
+    let (rtx, rrx) = std::sync::mpsc::channel();
+    let base = Index::load(&dir.join("index.bin"));
+    let phase = if base.is_none() { PHASE_SCANNING } else { PHASE_IDLE };
+    let content = if owner { Content::open(dir.join("content")) } else { Content::open_shared(dir.join("content")) };
+    let shared = Arc::new(Shared {
+        live: RwLock::new(None),
+        content: RwLock::new(content),
+        home: opts.home,
+        dir,
+        wake: tx,
+        save_requested: AtomicBool::new(false),
+        content_tx: Mutex::new(Some(ctx)),
+        content_rx: Mutex::new(Some(crx)),
+        content_pending: AtomicUsize::new(0),
+        owner: AtomicBool::new(owner),
+        lock,
+        stream: Mutex::new(None),
+        replaying: AtomicBool::new(!rooted),
+        content_seen: Mutex::new(None),
+        roots: root_bytes,
+        phase: AtomicU8::new(phase),
+        stopped: AtomicBool::new(false),
+        refresh_tx: Mutex::new(Some(rtx)),
+        refresh_rx: Mutex::new(rrx),
+        apply_thread: Mutex::new(None),
+        content_thread: Mutex::new(None),
+    });
+    let since = match &base {
+        Some(b) if b.event_id != 0 => b.event_id,
+        _ => unsafe { fsevents::FSEventsGetCurrentEventId() },
+    };
+    if owner && !rooted {
+        // Watch before scanning so nothing that changes mid-scan is
+        // missed; replaying it afterwards is harmless (diffs are idempotent).
+        shared.watch(since);
+    }
+    let s = shared.clone();
+    let handle = spawn_handle("fsearch-apply", move || {
+        let loaded_existing;
+        let base = match base {
+            Some(b) => {
+                log(format!("loaded {} entries, replaying events since {}", b.n, b.event_id));
+                loaded_existing = true;
+                if !owner && !s.rooted() {
                     s.watch(b.event_id);
-                    b
                 }
-            };
-            *s.live.write().unwrap() = Some(Live::new(base));
-            if owner {
-                start_content(&s);
+                b
             }
-            apply_loop(&s, rx);
-        });
-        Ok(Engine { s: shared })
+            None if owner => {
+                loaded_existing = false;
+                full_build(&s, since)
+            }
+            None => {
+                loaded_existing = true;
+                // The owner is building it; follow once it exists.
+                let b = wait_for_index(&s.dir);
+                if !s.rooted() {
+                    s.watch(b.event_id);
+                }
+                b
+            }
+        };
+        *s.live.write().unwrap() = Some(Live::new(base));
+        s.phase.store(PHASE_READY, Ordering::Relaxed);
+        if owner {
+            start_content(&s);
+        }
+        if s.rooted() && loaded_existing && owner && !s.stopped.load(Ordering::Acquire) {
+            let _ = refresh_roots(&s);
+        }
+        apply_loop(&s, rx);
+    });
+    *shared.apply_thread.lock().unwrap() = Some(handle);
+    Ok(Engine { s: shared })
+}
+
+fn invalidate_if_roots_changed(dir: &Path, roots: &[Vec<u8>]) {
+    let path = dir.join("roots.txt");
+    let new = roots.iter().map(|r| String::from_utf8_lossy(r)).collect::<Vec<_>>().join("\n");
+    let old = std::fs::read_to_string(&path).unwrap_or_default();
+    if old == new {
+        return;
+    }
+    let _ = std::fs::remove_file(dir.join("index.bin"));
+    let _ = std::fs::remove_dir_all(dir.join("content"));
+    let _ = std::fs::write(path, new);
+}
+
+impl Engine {
+    /// Start indexing in the background and return at once; searches answer
+    /// `Err` until the index is loaded (or, on the very first run, built).
+    ///
+    /// Whole-disk, macOS only: crawls `/` and follows FSEvents. On iOS use
+    /// [`Engine::start_roots`].
+    pub fn start(opts: Options) -> Result<Engine, String> {
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = opts;
+            return Err("whole-disk indexing is macOS-only; use Engine::start_roots with the folders the user picked".into());
+        }
+        #[cfg(target_os = "macos")]
+        start_inner(opts, Vec::new())
+    }
+
+    /// Index `roots` instead of `/`. No FSEvents thread: call [`Engine::refresh`]
+    /// when the app comes forward or the user asks. Works on macOS and iOS.
+    pub fn start_roots(opts: Options, roots: Vec<PathBuf>) -> Result<Engine, String> {
+        if roots.is_empty() {
+            return Err("start_roots needs at least one folder".into());
+        }
+        start_inner(opts, roots)
     }
 
     pub fn home(&self) -> &str {
@@ -225,6 +327,9 @@ impl Engine {
 
     /// Name search.
     pub fn search(&self, q: &Query) -> Result<Vec<Found>, String> {
+        if self.s.stopped.load(Ordering::Acquire) {
+            return Err("stopped".into());
+        }
         let g = self.s.live.read().unwrap();
         let Some(live) = g.as_ref() else { return Err(INDEXING.into()) };
         let mut p = Vec::new();
@@ -253,6 +358,9 @@ impl Engine {
     /// The bool says whether the content index answered (false: files were
     /// picked from the name index and read, for folders it doesn't cover).
     pub fn grep(&self, q: &Query, g: &Grep) -> Result<(GrepResult, bool), String> {
+        if self.s.stopped.load(Ordering::Acquire) {
+            return Err("stopped".into());
+        }
         let home = self.s.home.as_bytes();
         let indexed = q.scope.as_ref().is_none_or(|s| content::in_scope(s, home));
         if indexed {
@@ -293,6 +401,58 @@ impl Engine {
         self.s.save_requested.store(true, Ordering::Relaxed);
         let _ = self.s.wake.send(Vec::new());
     }
+
+    /// Rescan every root and fold the diff into the index. Blocks until the
+    /// background thread finishes. The whole-disk engine does not use this;
+    /// it follows FSEvents.
+    pub fn refresh(&self) -> Result<(), String> {
+        if !self.s.rooted() {
+            return Err("refresh() updates a rooted index; the whole-disk engine follows FSEvents".into());
+        }
+        if self.s.stopped.load(Ordering::Acquire) {
+            return Err("stopped".into());
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        {
+            let guard = self.s.refresh_tx.lock().unwrap();
+            let Some(jobs) = guard.as_ref() else { return Err("stopped".into()) };
+            jobs.send(tx).map_err(|_| "stopped".to_string())?;
+        }
+        self.s.wake.send(Vec::new()).map_err(|_| "stopped".to_string())?;
+        rx.recv().unwrap_or_else(|_| Err("stopped".into()))
+    }
+
+    /// Stop background threads and release the index lock so another engine
+    /// in this process can take over.
+    pub fn stop(&self) {
+        if self.s.stopped.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.s.phase.store(PHASE_STOPPED, Ordering::Relaxed);
+        *self.s.stream.lock().unwrap() = None;
+        *self.s.refresh_tx.lock().unwrap() = None;
+        let _ = self.s.wake.send(Vec::new());
+        if let Some(h) = self.s.apply_thread.lock().unwrap().take() {
+            let _ = h.join();
+        }
+        *self.s.content_tx.lock().unwrap() = None;
+        if let Some(h) = self.s.content_thread.lock().unwrap().take() {
+            let _ = h.join();
+        }
+        unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&self.s.lock), libc::LOCK_UN) };
+    }
+
+    pub fn progress(&self) -> IndexProgress {
+        let phase = self.s.phase.load(Ordering::Relaxed);
+        let live = self.s.live.read().unwrap();
+        IndexProgress {
+            phase: phase_name(phase).into(),
+            ready: live.is_some() && phase != PHASE_STOPPED,
+            entries: live.as_ref().map(|l| l.base.n as u64).unwrap_or(0),
+            scanned: walk::scan_entries(),
+            dirs_scanned: walk::scan_dirs(),
+        }
+    }
 }
 
 const INDEXING: &str = "indexing (first run scans the whole disk, ~20s)";
@@ -302,11 +462,35 @@ impl Shared {
         self.owner.load(Ordering::Relaxed)
     }
 
+    fn rooted(&self) -> bool {
+        !self.roots.is_empty()
+    }
+
+    fn send_content(&self, msg: (Vec<Vec<u8>>, Vec<Vec<u8>>)) {
+        if let Some(tx) = self.content_tx.lock().unwrap().as_ref() {
+            let _ = tx.send(msg);
+        }
+    }
+
     /// (Re)start the FSEvents stream from `since`, replacing any old one.
+    /// No-op for a rooted index and on targets without FSEvents.
     fn watch(&self, since: u64) {
-        self.replaying.store(true, Ordering::Relaxed);
-        let new = fsevents::watch(since, 0.1, self.wake.clone());
-        *self.stream.lock().unwrap() = Some(new);
+        if self.rooted() {
+            self.replaying.store(false, Ordering::Relaxed);
+            return;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            self.replaying.store(true, Ordering::Relaxed);
+            let new = fsevents::watch(since, 0.1, self.wake.clone());
+            *self.stream.lock().unwrap() = Some(new);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            // Keep the stub linked the same way the macOS stream is held.
+            let _ = fsevents::watch(since, 0.1, self.wake.clone());
+            self.replaying.store(false, Ordering::Relaxed);
+        }
     }
 
     /// A follower picks up what the owner wrote: a newer name-index save
@@ -319,7 +503,9 @@ impl Shared {
             && let Some(base) = Index::load(&path)
         {
             log(format!("following the owner's save: {} entries, replaying since {}", base.n, base.event_id));
-            self.watch(base.event_id);
+            if !self.rooted() {
+                self.watch(base.event_id);
+            }
             *self.live.write().unwrap() = Some(Live::new(base));
         }
         let cdir = self.dir.join("content");
@@ -334,11 +520,17 @@ impl Shared {
 
 fn start_content(s: &Arc<Shared>) {
     let Some(rx) = s.content_rx.lock().unwrap().take() else { return };
-    // Reconcile all of home once (cheap when nothing changed), then follow
-    // along with the name index's changes.
-    let _ = s.content_tx.send((Vec::new(), vec![s.home.as_bytes().to_vec()]));
-    let s = s.clone();
-    spawn("fsearch-content", move || content_loop(&s, rx));
+    // Reconcile once (cheap when nothing changed), then follow along with
+    // the name index's changes. Rooted engines index the picked folders,
+    // which are not necessarily under $HOME.
+    if s.rooted() {
+        s.send_content((Vec::new(), s.roots.clone()));
+    } else {
+        s.send_content((Vec::new(), vec![s.home.as_bytes().to_vec()]));
+    }
+    let s2 = s.clone();
+    let handle = spawn_handle("fsearch-content", move || content_loop(&s2, rx));
+    *s.content_thread.lock().unwrap() = Some(handle);
 }
 
 /// A follower takes over the index files once their owner is gone.
@@ -385,11 +577,11 @@ pub fn has_full_disk_access() -> bool {
 fn content_loop(shared: &Shared, rx: Receiver<(Vec<Vec<u8>>, Vec<Vec<u8>>)>) {
     // Indexing file contents is background work: utility QoS keeps it off
     // the user's way (lower CPU priority and IO tier).
-    unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0) };
+    crate::qos_utility();
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(4)
-        .start_handler(|_| unsafe {
-            libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0);
+        .start_handler(|_| {
+            crate::qos_utility();
             no_materialize();
         })
         .build()
@@ -481,7 +673,10 @@ fn content_loop(shared: &Shared, rx: Receiver<(Vec<Vec<u8>>, Vec<Vec<u8>>)>) {
 fn full_build(shared: &Shared, event_id: u64) -> Index {
     let t = Instant::now();
     let started = crate::query::now_secs();
-    let ls = walk::scan(b"/", SCAN_THREADS);
+    shared.phase.store(PHASE_SCANNING, Ordering::Relaxed);
+    walk::reset_scan_count();
+    let ls = if shared.roots.is_empty() { walk::scan(b"/", SCAN_THREADS) } else { crate::roots::scan_roots(&shared.roots, SCAN_THREADS) };
+    walk::finish_scan_count();
     let idx = Index::build(ls, event_id, started, shared.home.as_bytes());
     let path = shared.dir.join("index.bin");
     if let Err(e) = idx.save(&path) {
@@ -494,6 +689,7 @@ fn full_build(shared: &Shared, event_id: u64) -> Index {
     Index::load(&path).unwrap_or(idx)
 }
 
+#[cfg(target_vendor = "apple")]
 unsafe extern "C" {
     fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
 }
@@ -501,7 +697,10 @@ unsafe extern "C" {
 /// Hand freed allocator memory back to the OS after big transient work
 /// (index builds, content batches) instead of letting malloc cache it.
 fn release_memory() {
-    unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) };
+    #[cfg(target_vendor = "apple")]
+    unsafe {
+        malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
+    }
 }
 
 fn compact(shared: &Shared) {
@@ -554,11 +753,59 @@ fn relist_changed(shared: &Shared, why: &str, flags: u32) {
         std::mem::take(&mut live.trees)
     };
     let n = dirs.len();
-    let _ = shared.content_tx.send((dirs, trees));
+    shared.send_content((dirs, trees));
     log(format!(
         "FSEvents lost track of / ({why}, flags {flags:#x}): relisted {n} folders changed since {from} in {:.2?} ({stat_time:.2?} checking)",
         t.elapsed()
     ));
+}
+
+fn drain_refresh(shared: &Shared, failing: bool) {
+    let jobs: Vec<Sender<Result<(), String>>> = shared.refresh_rx.lock().unwrap().try_iter().collect();
+    for reply in jobs {
+        if failing || shared.stopped.load(Ordering::Acquire) {
+            let _ = reply.send(Err("stopped".into()));
+        } else {
+            let _ = reply.send(refresh_roots(shared));
+        }
+    }
+}
+
+/// Rescan each root and compact. Runs on the apply thread.
+fn refresh_roots(shared: &Shared) -> Result<(), String> {
+    if shared.roots.is_empty() {
+        return Err("refresh() updates a rooted index".into());
+    }
+    if shared.live.read().unwrap().is_none() {
+        return Err(INDEXING.into());
+    }
+    shared.phase.store(PHASE_REFRESHING, Ordering::Relaxed);
+    walk::reset_scan_count();
+    for root in &shared.roots {
+        if shared.stopped.load(Ordering::Acquire) {
+            walk::finish_scan_count();
+            shared.phase.store(PHASE_STOPPED, Ordering::Relaxed);
+            return Err("stopped".into());
+        }
+        let fetched = {
+            let g = shared.live.read().unwrap();
+            let live = g.as_ref().unwrap();
+            live.fetch(root, true)
+        };
+        shared.live.write().unwrap().as_mut().unwrap().apply(fetched);
+    }
+    walk::finish_scan_count();
+    shared.send_content((Vec::new(), shared.roots.clone()));
+    if let Some(live) = shared.live.write().unwrap().as_mut() {
+        live.synced_at = crate::query::now_secs();
+    }
+    if shared.owner() {
+        compact(shared);
+    }
+    if !shared.stopped.load(Ordering::Acquire) {
+        shared.phase.store(PHASE_READY, Ordering::Relaxed);
+    }
+    Ok(())
 }
 
 fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
@@ -572,6 +819,11 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
             Err(RecvTimeoutError::Disconnected) => return,
         };
         events.extend(rx.try_iter().flatten());
+        if shared.stopped.load(Ordering::Acquire) {
+            drain_refresh(shared, true);
+            return;
+        }
+        drain_refresh(shared, false);
         // The owner wrote the index files: a follower picks that up now
         // rather than at its next periodic check.
         let owner_wrote = events.iter().any(|e| e.path.starts_with(ours));
@@ -612,7 +864,7 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
             }
             let (rec, flat): (Vec<_>, Vec<_>) = dirs.into_iter().partition(|(_, r)| *r);
             trees.extend(rec.into_iter().map(|(p, _)| p));
-            let _ = shared.content_tx.send((flat.into_iter().map(|(p, _)| p).collect(), trees));
+            shared.send_content((flat.into_iter().map(|(p, _)| p).collect(), trees));
             if rebuild {
                 let why = match root_flags {
                     f if f & KERNEL_DROPPED != 0 => "kernel dropped events",

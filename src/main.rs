@@ -1,10 +1,15 @@
+#[cfg(target_os = "macos")]
 mod server;
 
+#[cfg(target_os = "macos")]
 use fsearch::{index, live, query};
 
 use std::alloc::{GlobalAlloc, Layout, System};
+#[cfg(target_os = "macos")]
 use std::io::{BufRead, BufReader, Write};
+#[cfg(target_os = "macos")]
 use std::path::PathBuf;
+#[cfg(target_os = "macos")]
 use std::time::Instant;
 
 /// Big buffers (index builds, content batches) come straight from mmap and
@@ -51,6 +56,7 @@ unsafe impl GlobalAlloc for Alloc {
 #[global_allocator]
 static GLOBAL: Alloc = Alloc;
 
+#[cfg(target_os = "macos")]
 const USAGE: &str = "usage:
   fsearch <query...> [--json]   search (starts the daemon if needed)
   fsearch stdio                 JSON lines on stdin/stdout
@@ -61,23 +67,38 @@ const USAGE: &str = "usage:
   fsearch uninstall             remove the login agent (keeps the index)
   fsearch bench <query...>      time a query in-process against the saved index";
 
+#[cfg(target_os = "macos")]
 const LABEL: &str = "mt.nd.fsearch";
 
+#[cfg(target_os = "macos")]
 fn home() -> String {
     std::env::var("HOME").unwrap_or_else(|_| "/".into())
 }
 
+#[cfg(target_os = "macos")]
 fn data_dir() -> PathBuf {
     let d = PathBuf::from(home()).join("Library/Application Support/FSearch");
     std::fs::create_dir_all(&d).ok();
     d
 }
 
+#[cfg(target_os = "macos")]
 unsafe extern "C" {
     fn setiopolicy_np(iotype: i32, scope: i32, policy: i32) -> i32;
 }
 
 fn main() {
+    #[cfg(target_os = "macos")]
+    macos_main();
+    #[cfg(not(target_os = "macos"))]
+    {
+        eprintln!("fsearch CLI is macOS-only. Link the library and call Engine::start_roots.");
+        std::process::exit(1);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_main() {
     // Never let a search download iCloud placeholders: opening or listing a
     // dataless file/dir fails fast instead of materializing it.
     // (IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_PROCESS, OFF)
@@ -99,6 +120,7 @@ fn main() {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn print_one(req: &serde_json::Value, raw: bool) {
     let mut s = server::connect(&data_dir()).unwrap_or_else(|e| die(&format!("cannot reach daemon: {e}")));
     writeln!(s, "{req}").unwrap();
@@ -123,6 +145,7 @@ fn print_one(req: &serde_json::Value, raw: bool) {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn stdio() {
     let s = server::connect(&data_dir()).unwrap_or_else(|e| die(&format!("cannot reach daemon: {e}")));
     let mut up = s.try_clone().unwrap();
@@ -144,6 +167,7 @@ fn stdio() {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn bench(qs: &str) {
     let idx = index::Index::load(&data_dir().join("index.bin")).unwrap_or_else(|| die("no index yet; run fsearch serve"));
     let live = live::Live::new(idx);
@@ -165,18 +189,22 @@ fn bench(qs: &str) {
     eprintln!("first {:.2?}  median {:.2?}  min {:.2?}", times[0].max(times[times.len() - 1]), times[times.len() / 2], times[0]);
 }
 
+#[cfg(target_os = "macos")]
 fn plist_path() -> PathBuf {
     PathBuf::from(home()).join(format!("Library/LaunchAgents/{LABEL}.plist"))
 }
 
+#[cfg(target_os = "macos")]
 fn launchctl(args: &[&str]) -> bool {
     std::process::Command::new("launchctl").args(args).stderr(std::process::Stdio::null()).status().is_ok_and(|s| s.success())
 }
 
+#[cfg(target_os = "macos")]
 fn domain() -> String {
     format!("gui/{}", unsafe { libc::getuid() })
 }
 
+#[cfg(target_os = "macos")]
 fn install(login: bool) {
     let bin = PathBuf::from(home()).join(".local/bin/fsearch");
     std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
@@ -223,12 +251,14 @@ fn install(login: bool) {
     println!("installed {} (LaunchAgent {LABEL})", bin.display());
 }
 
+#[cfg(target_os = "macos")]
 fn uninstall() {
     launchctl(&["bootout", &format!("{}/{LABEL}", domain())]);
     let _ = std::fs::remove_file(plist_path());
     println!("removed LaunchAgent {LABEL}; index kept in {}", data_dir().display());
 }
 
+#[cfg(target_os = "macos")]
 fn die(msg: &str) -> ! {
     eprintln!("fsearch: {msg}");
     std::process::exit(1)

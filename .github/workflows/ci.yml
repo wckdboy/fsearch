@@ -1,0 +1,120 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["ios-v*"]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+jobs:
+  build:
+    name: macOS CLI, XCFramework, demo
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios,aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: macOS CLI
+        run: cargo build --release
+
+      - name: XCFramework
+        run: ./apple/build-xcframework.sh
+
+      - name: Swift package
+        working-directory: apple/FSearchKit
+        run: |
+          test -d FSearchFFI.xcframework
+          swift build
+
+      - name: Demo app for the iOS simulator
+        run: |
+          xcodebuild \
+            -project apple/FSearchDemo/FSearchDemo.xcodeproj \
+            -scheme FSearchDemo \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath apple/FSearchDemo/build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Zip the XCFramework
+        if: startsWith(github.ref, 'refs/tags/ios-v')
+        run: |
+          mkdir -p dist
+          ditto -c -k --keepParent apple/FSearchKit/FSearchFFI.xcframework dist/FSearchFFI.xcframework.zip
+
+      - uses: actions/upload-artifact@v4
+        if: startsWith(github.ref, 'refs/tags/ios-v')
+        with:
+          name: FSearchFFI.xcframework.zip
+          path: dist/FSearchFFI.xcframework.zip
+          if-no-files-found: error
+
+  release:
+    name: Publish XCFramework
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/ios-v')
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: FSearchFFI.xcframework.zip
+          path: dist
+
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          if gh release view "$tag" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/FSearchFFI.xcframework.zip --repo "${GITHUB_REPOSITORY}" --clobber
+          else
+            gh release create "$tag" dist/FSearchFFI.xcframework.zip \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "$tag" \
+              --notes "FSearchFFI.xcframework for FSearchKit. Unzip is unnecessary: Swift Package Manager consumes the zip as a binary target."
+          fi
+
+      - name: Write the checksum into Package.swift
+        id: checksum
+        run: |
+          checksum=$(swift package compute-checksum ../../dist/FSearchFFI.xcframework.zip)
+          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/FSearchFFI.xcframework.zip"
+          python3 ../../apple/update-checksum.py "$url" "$checksum"
+          echo "checksum=$checksum" >> "$GITHUB_OUTPUT"
+        working-directory: apple/FSearchKit
+
+      - name: Push the checksum to main
+        continue-on-error: true
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add apple/FSearchKit/Package.swift
+          if git diff --cached --quiet; then
+            echo "Package.swift already matches this release"
+            exit 0
+          fi
+          git commit -m "Point FSearchKit at ${GITHUB_REF_NAME}"
+          git push origin HEAD:main
